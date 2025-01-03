@@ -19,7 +19,7 @@ defmodule Aqua.Jason.Encode do
 
   import Bitwise
 
-  alias Jason.{Codegen, EncodeError, Encoder, Fragment, OrderedObject}
+  alias Aqua.Jason.{Codegen, EncodeError, Encoder, Fragment, OrderedObject}
 
   @typep escape :: (String.t(), String.t(), integer -> iodata)
   @typep encode_map :: (map, escape, encode_map -> iodata)
