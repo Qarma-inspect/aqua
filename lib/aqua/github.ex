@@ -8,7 +8,7 @@ defmodule Aqua.Github do
 
     case :httpc.request(
            :get,
-           {'https://api.github.com/orgs/aquapm/repos', [{'User-Agent', 'aqua'}]},
+           {~c"https://api.github.com/orgs/aquapm/repos", [{~c"User-Agent", ~c"aqua"}]},
            [{:ssl, [{:verify, 0}]}],
            []
          ) do
@@ -33,7 +33,7 @@ defmodule Aqua.Github do
 
     case :httpc.request(
            :get,
-           {String.to_charlist(url), [{'User-Agent', 'aqua'}]},
+           {String.to_charlist(url), [{~c"User-Agent", ~c"aqua"}]},
            [{:ssl, [{:verify, 0}]}],
            []
          ) do
