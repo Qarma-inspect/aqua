@@ -25,7 +25,7 @@ defmodule Aqua.MixProject do
     ]
   end
 
-  def application, do: [extra_applications: [:logger]]
+  def application, do: [extra_applications: [:logger, :ssl, :inets]]
 
   def description() do
     """
@@ -38,8 +38,9 @@ defmodule Aqua.MixProject do
     [
       {:ex_doc, ">= 0.0.0", only: :dev},
       {:excoveralls, "~> 0.11", only: :test},
-      {:credo, "~> 1.1", only: [:dev, :test], runtime: false},
-      {:mix_test_watch, "~> 0.8", only: :dev, runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:mix_test_watch, "~> 1.2", only: :dev, runtime: false},
+      {:decimal, "~> 2.3"}
     ]
   end
 
