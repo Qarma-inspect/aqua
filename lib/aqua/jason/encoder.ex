@@ -1,8 +1,66 @@
 defprotocol Aqua.Jason.Encoder do
-  @moduledoc false
+  @moduledoc """
+  Protocol controlling how a value is encoded to JSON.
+
+  ## Deriving
+
+  The protocol allows leveraging the Elixir's `@derive` feature
+  to simplify protocol implementation in trivial cases. Accepted
+  options are:
+
+    * `:only` - encodes only values of specified keys.
+    * `:except` - encodes all struct fields except specified keys.
+
+  By default all keys except the `:__struct__` key are encoded.
+
+  ## Example
+
+  Let's assume a presence of the following struct:
+
+      defmodule Test do
+        defstruct [:foo, :bar, :baz]
+      end
+
+  If we were to call `@derive Jason.Encoder` just before `defstruct`,
+  an implementation similar to the following implementation would be generated:
+
+      defimpl Jason.Encoder, for: Test do
+        def encode(value, opts) do
+          Jason.Encode.map(Map.take(value, [:foo, :bar, :baz]), opts)
+        end
+      end
+
+  If we called `@derive {Jason.Encoder, only: [:foo]}`, an implementation
+  similar to the following implementation would be generated:
+
+      defimpl Jason.Encoder, for: Test do
+        def encode(value, opts) do
+          Jason.Encode.map(Map.take(value, [:foo]), opts)
+        end
+      end
+
+  If we called `@derive {Jason.Encoder, except: [:foo]}`, an implementation
+  similar to the following implementation would be generated:
+
+      defimpl Jason.Encoder, for: Test do
+        def encode(value, opts) do
+          Jason.Encode.map(Map.take(value, [:bar, :baz]), opts)
+        end
+      end
+
+  The actually generated implementations are more efficient computing some data
+  during compilation similar to the macros from the `Jason.Helpers` module.
+
+  ## Explicit implementation
+
+  If you wish to implement the protocol fully yourself, it is advised to
+  use functions from the `Jason.Encode` module to do the actual iodata
+  generation - they are highly optimized and verified to always produce
+  valid JSON.
+  """
 
   @type t :: term
-  @type opts :: Aqua.Jason.Encode.opts()
+  @type opts :: Jason.Encode.opts()
 
   @fallback_to_any true
 
@@ -19,11 +77,11 @@ end
 defimpl Aqua.Jason.Encoder, for: Any do
   defmacro __deriving__(module, struct, opts) do
     fields = fields_to_encode(struct, opts)
-    kv = Enum.map(fields, &{&1, generated_var(&1, __MODULE__)})
+    kv = Enum.map(fields, &{&1, generated_var(&1)})
     escape = quote(do: escape)
     encode_map = quote(do: encode_map)
     encode_args = [escape, encode_map]
-    kv_iodata = Aqua.Jason.Codegen.build_kv_iodata(kv, encode_args)
+    kv_iodata = Jason.Codegen.build_kv_iodata(kv, encode_args)
 
     quote do
       defimpl Aqua.Jason.Encoder, for: unquote(module) do
@@ -36,9 +94,13 @@ defimpl Aqua.Jason.Encoder, for: Any do
     end
   end
 
-  # The same as Macro.var/2 except it sets generated: true
-  defp generated_var(name, context) do
-    {name, [generated: true], context}
+  # The same as Macro.var/2 except it sets generated: true and handles _ key
+  defp generated_var(:_) do
+    {:__, [generated: true], __MODULE__.Underscore}
+  end
+
+  defp generated_var(name) do
+    {name, [generated: true], __MODULE__}
   end
 
   def encode(%_{} = struct, _opts) do
@@ -77,15 +139,33 @@ defimpl Aqua.Jason.Encoder, for: Any do
   end
 
   defp fields_to_encode(struct, opts) do
+    fields = Map.keys(struct)
+
     cond do
       only = Keyword.get(opts, :only) ->
-        only
+        case only -- fields do
+          [] ->
+            only
+
+          error_keys ->
+            raise ArgumentError,
+                  "`:only` specified keys (#{inspect(error_keys)}) that are not defined in defstruct: " <>
+                    "#{inspect(fields -- [:__struct__])}"
+        end
 
       except = Keyword.get(opts, :except) ->
-        Map.keys(struct) -- [:__struct__ | except]
+        case except -- fields do
+          [] ->
+            fields -- [:__struct__ | except]
+
+          error_keys ->
+            raise ArgumentError,
+                  "`:except` specified keys (#{inspect(error_keys)}) that are not defined in defstruct: " <>
+                    "#{inspect(fields -- [:__struct__])}"
+        end
 
       true ->
-        Map.keys(struct) -- [:__struct__]
+        fields -- [:__struct__]
     end
   end
 end
@@ -139,15 +219,15 @@ end
 
 defimpl Aqua.Jason.Encoder, for: [Date, Time, NaiveDateTime, DateTime] do
   def encode(value, _opts) do
-    [?\", @for.to_iso8601(value), ?\"]
+    [?", @for.to_iso8601(value), ?"]
   end
 end
 
-defimpl Aqua.Jason.Encoder, for: Decimal do
-  def encode(value, _opts) do
-    # silence the xref warning
-    decimal = Decimal
-    [?\", decimal.to_string(value), ?\"]
+if Code.ensure_loaded?(Decimal) do
+  defimpl Aqua.Jason.Encoder, for: Decimal do
+    def encode(value, _opts) do
+      [?", Decimal.to_string(value), ?"]
+    end
   end
 end
 

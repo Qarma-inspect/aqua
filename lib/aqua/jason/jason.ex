@@ -1,18 +1,25 @@
 defmodule Aqua.Jason do
-  @moduledoc false
+  @moduledoc """
+  A blazing fast JSON parser and generator in pure Elixir.
+  """
 
   alias Aqua.Jason.{Encode, Decoder, DecodeError, EncodeError, Formatter}
 
   @type escape :: :json | :unicode_safe | :html_safe | :javascript_safe
   @type maps :: :naive | :strict
 
-  @type encode_opt :: {:escape, escape} | {:maps, maps} | {:pretty, true | Formatter.opts()}
+  @type encode_opt :: {:escape, escape} | {:maps, maps} | {:pretty, boolean | Formatter.opts()}
 
   @type keys :: :atoms | :atoms! | :strings | :copy | (String.t() -> term)
 
   @type strings :: :reference | :copy
 
-  @type decode_opt :: {:keys, keys} | {:strings, strings}
+  @type floats :: :native | :decimals
+
+  @type objects :: :maps | :ordered_objects
+
+  @type decode_opt ::
+          {:keys, keys} | {:strings, strings} | {:floats, floats} | {:objects, objects}
 
   @doc """
   Parses a JSON value from `input` iodata.
@@ -33,6 +40,16 @@ defmodule Aqua.Jason do
       * `:copy` - always copies the strings. This option is especially useful when parts of the
         decoded data will be stored for a long time (in ets or some process) to avoid keeping
         the reference to the original data.
+
+    * `:floats` - controls how floats are decoded. Possible values are:
+
+      * `:native` (default) - Native conversion from binary to float using `:erlang.binary_to_float/1`,
+      * `:decimals` - uses `Decimal.new/1` to parse the binary into a Decimal struct with arbitrary precision.
+
+    * `:objects` - controls how objects are decoded. Possible values are:
+
+      * `:maps` (default) - objects are decoded as maps
+      * `:ordered_objects` - objects are decoded as `Jason.OrderedObject` structs
 
   ## Decoding keys to atoms
 
@@ -66,7 +83,7 @@ defmodule Aqua.Jason do
       %{}
 
       iex> Jason.decode!("invalid")
-      ** (Jason.DecodeError) unexpected byte at position 0: 0x69 ('i')
+      ** (Jason.DecodeError) unexpected byte at position 0: 0x69 ("i")
 
   """
   @spec decode!(iodata, [decode_opt]) :: term | no_return
@@ -91,9 +108,9 @@ defmodule Aqua.Jason do
       * `:json` (default) - the regular JSON escaping as defined by RFC 7159.
       * `:javascript_safe` - additionally escapes the LINE SEPARATOR (U+2028)
         and PARAGRAPH SEPARATOR (U+2029) characters to make the produced JSON
-        valid JavaSciprt.
-      * `:html_safe` - similar to `:javascript`, but also escapes the `/`
-        caracter to prevent XSS.
+        valid JavaScript.
+      * `:html_safe` - similar to `:javascript_safe`, but also escapes the `/`
+        character to prevent XSS.
       * `:unicode_safe` - escapes all non-ascii characters.
 
     * `:maps` - controls how maps are encoded. Possible values are:
@@ -221,6 +238,6 @@ defmodule Aqua.Jason do
   end
 
   defp format_decode_opts(opts) do
-    Enum.into(opts, %{keys: :strings, strings: :reference})
+    Enum.into(opts, %{keys: :strings, strings: :reference, floats: :native, objects: :maps})
   end
 end

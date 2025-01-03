@@ -1,5 +1,11 @@
 defmodule Aqua.Jason.Formatter do
-  @moduledoc false
+  @moduledoc ~S"""
+  Pretty-printing and minimizing functions for JSON-encoded data.
+
+  Input is required to be in an 8-bit-wide encoding such as UTF-8 or Latin-1
+  in `t:iodata/0` format. Input must have valid JSON, invalid JSON may produce
+  unexpected results or errors.
+  """
 
   @type opts :: [
           {:indent, iodata}
@@ -10,6 +16,8 @@ defmodule Aqua.Jason.Formatter do
 
   import Record
   defrecordp :opts, [:indent, :line, :record, :colon]
+
+  @dialyzer :no_improper_lists
 
   @doc ~S"""
   Pretty-prints JSON-encoded `input`.
@@ -156,11 +164,11 @@ defmodule Aqua.Jason.Formatter do
     cont.(tail, output_acc)
   end
 
-  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in ' \n\r\t' do
+  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in ~c' \n\r\t' do
     pp_iodata(rest, output, depth, empty, opts)
   end
 
-  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in '{[' do
+  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in ~c'{[' do
     {out, depth} =
       cond do
         depth == :first -> {byte, 1}
@@ -173,25 +181,25 @@ defmodule Aqua.Jason.Formatter do
     pp_iodata(rest, [output, out], depth, empty, opts)
   end
 
-  defp pp_byte(byte, rest, output, depth, true = _empty, opts) when byte in '}]' do
+  defp pp_byte(byte, rest, output, depth, true = _empty, opts) when byte in ~c'}]' do
     empty = false
     depth = depth - 1
     pp_iodata(rest, [output, byte], depth, empty, opts)
   end
 
-  defp pp_byte(byte, rest, output, depth, false = empty, opts) when byte in '}]' do
+  defp pp_byte(byte, rest, output, depth, false = empty, opts) when byte in ~c'}]' do
     depth = depth - 1
     out = [opts(opts, :line), tab(opts(opts, :indent), depth), byte]
     pp_iodata(rest, [output, out], depth, empty, opts)
   end
 
-  defp pp_byte(byte, rest, output, depth, _empty, opts) when byte in ',' do
+  defp pp_byte(byte, rest, output, depth, _empty, opts) when byte in ~c',' do
     empty = false
     out = [byte, opts(opts, :line), tab(opts(opts, :indent), depth)]
     pp_iodata(rest, [output, out], depth, empty, opts)
   end
 
-  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in ':' do
+  defp pp_byte(byte, rest, output, depth, empty, opts) when byte in ~c':' do
     out = [byte, opts(opts, :colon)]
     pp_iodata(rest, [output, out], depth, empty, opts)
   end

@@ -1,5 +1,4 @@
 defmodule Aqua.Jason.DecodeError do
-  @moduledoc false
   @type t :: %__MODULE__{position: integer, data: String.t()}
 
   defexception [:position, :token, :data]
@@ -18,7 +17,7 @@ defmodule Aqua.Jason.DecodeError do
 
     if String.printable?(str) do
       "unexpected byte at position #{position}: " <>
-        "#{inspect(byte, base: :hex)} ('#{str}')"
+        "#{inspect(byte, base: :hex)} (#{inspect(str)})"
     else
       "unexpected byte at position #{position}: " <>
         "#{inspect(byte, base: :hex)}"
@@ -34,6 +33,9 @@ defmodule Aqua.Jason.Decoder do
   alias Aqua.Jason.{DecodeError, Codegen}
 
   import Codegen, only: [bytecase: 2, bytecase: 3]
+  import Record
+
+  @dialyzer :no_improper_lists
 
   # @compile :native
 
@@ -44,12 +46,24 @@ defmodule Aqua.Jason.Decoder do
   @key 2
   @object 3
 
+  defrecordp :decode, keys: nil, strings: nil, objects: nil, floats: nil
+
   def parse(data, opts) when is_binary(data) do
     key_decode = key_decode_function(opts)
     string_decode = string_decode_function(opts)
+    float_decode = float_decode_function(opts)
+    object_decode = object_decode_function(opts)
+
+    decode =
+      decode(
+        keys: key_decode,
+        strings: string_decode,
+        objects: object_decode,
+        floats: float_decode
+      )
 
     try do
-      value(data, data, 0, [@terminate], key_decode, string_decode)
+      value(data, data, 0, [@terminate], decode)
     catch
       {:position, position} ->
         {:error, %DecodeError{position: position, data: data}}
@@ -70,332 +84,291 @@ defmodule Aqua.Jason.Decoder do
   defp string_decode_function(%{strings: :copy}), do: &:binary.copy/1
   defp string_decode_function(%{strings: :reference}), do: & &1
 
-  defp value(data, original, skip, stack, key_decode, string_decode) do
+  defp object_decode_function(%{objects: :maps}), do: &:maps.from_list/1
+
+  defp object_decode_function(%{objects: :ordered_objects}),
+    do: &Aqua.Jason.OrderedObject.new(:lists.reverse(&1))
+
+  defp float_decode_function(%{floats: :native}) do
+    fn string, token, skip ->
+      try do
+        :erlang.binary_to_float(string)
+      catch
+        :error, :badarg ->
+          token_error(token, skip)
+      end
+    end
+  end
+
+  if Code.ensure_loaded?(Decimal) do
+    defp float_decode_function(%{floats: :decimals}) do
+      fn string, token, skip ->
+        try do
+          Decimal.new(string)
+        rescue
+          Decimal.Error ->
+            token_error(token, skip)
+        end
+      end
+    end
+  else
+    defp float_decode_function(%{floats: :decimals}) do
+      raise ArgumentError, "decimal library not found, :decimals option not available"
+    end
+  end
+
+  defp value(data, original, skip, stack, decode) do
     bytecase data do
-      _ in '\s\n\t\r', rest ->
-        value(rest, original, skip + 1, stack, key_decode, string_decode)
+      _ in ~c'\s\n\t\r', rest ->
+        value(rest, original, skip + 1, stack, decode)
 
-      _ in '0', rest ->
-        number_zero(rest, original, skip, stack, key_decode, string_decode, 1)
+      _ in ~c'0', rest ->
+        number_zero(rest, original, skip, stack, decode, 1)
 
-      _ in '123456789', rest ->
-        number(rest, original, skip, stack, key_decode, string_decode, 1)
+      _ in ~c'123456789', rest ->
+        number(rest, original, skip, stack, decode, 1)
 
-      _ in '-', rest ->
-        number_minus(rest, original, skip, stack, key_decode, string_decode)
+      _ in ~c'-', rest ->
+        number_minus(rest, original, skip, stack, decode)
 
-      _ in '"', rest ->
-        string(rest, original, skip + 1, stack, key_decode, string_decode, 0)
+      _ in ~c'"', rest ->
+        string(rest, original, skip + 1, stack, decode, 0)
 
-      _ in '[', rest ->
-        array(rest, original, skip + 1, stack, key_decode, string_decode)
+      _ in ~c'[', rest ->
+        array(rest, original, skip + 1, stack, decode)
 
-      _ in '{', rest ->
-        object(rest, original, skip + 1, stack, key_decode, string_decode)
+      _ in ~c'{', rest ->
+        object(rest, original, skip + 1, stack, decode)
 
-      _ in ']', rest ->
-        empty_array(rest, original, skip + 1, stack, key_decode, string_decode)
+      _ in ~c']', rest ->
+        empty_array(rest, original, skip + 1, stack, decode)
 
-      _ in 't', rest ->
+      _ in ~c't', rest ->
         case rest do
           <<"rue", rest::bits>> ->
-            continue(rest, original, skip + 4, stack, key_decode, string_decode, true)
+            continue(rest, original, skip + 4, stack, decode, true)
 
           <<_::bits>> ->
             error(original, skip)
         end
 
-      _ in 'f', rest ->
+      _ in ~c'f', rest ->
         case rest do
           <<"alse", rest::bits>> ->
-            continue(rest, original, skip + 5, stack, key_decode, string_decode, false)
+            continue(rest, original, skip + 5, stack, decode, false)
 
           <<_::bits>> ->
             error(original, skip)
         end
 
-      _ in 'n', rest ->
+      _ in ~c'n', rest ->
         case rest do
           <<"ull", rest::bits>> ->
-            continue(rest, original, skip + 4, stack, key_decode, string_decode, nil)
+            continue(rest, original, skip + 4, stack, decode, nil)
 
           <<_::bits>> ->
             error(original, skip)
         end
 
       _, rest ->
-        error(rest, original, skip + 1, stack, key_decode, string_decode)
+        error(rest, original, skip + 1, stack, decode)
 
       <<_::bits>> ->
         error(original, skip)
     end
   end
 
-  defp number_minus(<<?0, rest::bits>>, original, skip, stack, key_decode, string_decode) do
-    number_zero(rest, original, skip, stack, key_decode, string_decode, 2)
+  defp number_minus(<<?0, rest::bits>>, original, skip, stack, decode) do
+    number_zero(rest, original, skip, stack, decode, 2)
   end
 
-  defp number_minus(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode)
-       when byte in '123456789' do
-    number(rest, original, skip, stack, key_decode, string_decode, 2)
+  defp number_minus(<<byte, rest::bits>>, original, skip, stack, decode)
+       when byte in ~c'123456789' do
+    number(rest, original, skip, stack, decode, 2)
   end
 
-  defp number_minus(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode) do
+  defp number_minus(<<_rest::bits>>, original, skip, _stack, _decode) do
     error(original, skip + 1)
   end
 
-  defp number(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when byte in '0123456789' do
-    number(rest, original, skip, stack, key_decode, string_decode, len + 1)
+  if function_exported?(Application, :compile_env, 3) do
+    @integer_digit_limit Application.compile_env(:jason, :decoding_integer_digit_limit, 1024)
+  else
+    # use apply to avoid warnings in newer Elixir versions
+    @integer_digit_limit apply(Application, :get_env, [
+                           :jason,
+                           :decoding_integer_digit_limit,
+                           1024
+                         ])
   end
 
-  defp number(<<?., rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
-    number_frac(rest, original, skip, stack, key_decode, string_decode, len + 1)
+  defp number(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number(<<e, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when e in 'eE' do
+  defp number(<<?., rest::bits>>, original, skip, stack, decode, len) do
+    number_frac(rest, original, skip, stack, decode, len + 1)
+  end
+
+  defp number(<<e, rest::bits>>, original, skip, stack, decode, len) when e in ~c'eE' do
     prefix = binary_part(original, skip, len)
-    number_exp_copy(rest, original, skip + len + 1, stack, key_decode, string_decode, prefix)
+    number_exp_copy(rest, original, skip + len + 1, stack, decode, prefix)
   end
 
-  defp number(<<rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
-    int = String.to_integer(binary_part(original, skip, len))
-    continue(rest, original, skip + len, stack, key_decode, string_decode, int)
-  end
-
-  defp number_frac(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when byte in '0123456789' do
-    number_frac_cont(rest, original, skip, stack, key_decode, string_decode, len + 1)
-  end
-
-  defp number_frac(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode, len) do
-    error(original, skip + len)
-  end
-
-  defp number_frac_cont(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         len
-       )
-       when byte in '0123456789' do
-    number_frac_cont(rest, original, skip, stack, key_decode, string_decode, len + 1)
-  end
-
-  defp number_frac_cont(<<e, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when e in 'eE' do
-    number_exp(rest, original, skip, stack, key_decode, string_decode, len + 1)
-  end
-
-  defp number_frac_cont(<<rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
+  defp number(<<rest::bits>>, original, skip, stack, decode, len) do
     token = binary_part(original, skip, len)
-    float = try_parse_float(token, token, skip)
-    continue(rest, original, skip + len, stack, key_decode, string_decode, float)
+
+    if byte_size(token) > @integer_digit_limit do
+      token_error(token, skip)
+    end
+
+    int = String.to_integer(token)
+    continue(rest, original, skip + len, stack, decode, int)
   end
 
-  defp number_exp(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, len + 1)
+  defp number_frac(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number_frac_cont(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_exp(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when byte in '+-' do
-    number_exp_sign(rest, original, skip, stack, key_decode, string_decode, len + 1)
-  end
-
-  defp number_exp(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode, len) do
+  defp number_frac(<<_rest::bits>>, original, skip, _stack, _decode, len) do
     error(original, skip + len)
   end
 
-  defp number_exp_sign(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         len
-       )
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, len + 1)
+  defp number_frac_cont(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number_frac_cont(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_exp_sign(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode, len) do
-    error(original, skip + len)
+  defp number_frac_cont(<<e, rest::bits>>, original, skip, stack, decode, len)
+       when e in ~c'eE' do
+    number_exp(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_exp_cont(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         len
-       )
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, len + 1)
-  end
-
-  defp number_exp_cont(<<rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
+  defp number_frac_cont(<<rest::bits>>, original, skip, stack, decode, len) do
     token = binary_part(original, skip, len)
-    float = try_parse_float(token, token, skip)
-    continue(rest, original, skip + len, stack, key_decode, string_decode, float)
+    decode(floats: float_decode) = decode
+    float = float_decode.(token, token, skip)
+    continue(rest, original, skip + len, stack, decode, float)
   end
 
-  defp number_exp_copy(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         prefix
-       )
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, prefix, 1)
+  defp number_exp(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_exp_copy(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         prefix
-       )
-       when byte in '+-' do
-    number_exp_sign(rest, original, skip, stack, key_decode, string_decode, prefix, 1)
+  defp number_exp(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'+-' do
+    number_exp_sign(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_exp_copy(
-         <<_rest::bits>>,
-         original,
-         skip,
-         _stack,
-         _key_decode,
-         _string_decode,
-         _prefix
-       ) do
+  defp number_exp(<<_rest::bits>>, original, skip, _stack, _decode, len) do
+    error(original, skip + len)
+  end
+
+  defp number_exp_sign(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, len + 1)
+  end
+
+  defp number_exp_sign(<<_rest::bits>>, original, skip, _stack, _decode, len) do
+    error(original, skip + len)
+  end
+
+  defp number_exp_cont(<<byte, rest::bits>>, original, skip, stack, decode, len)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, len + 1)
+  end
+
+  defp number_exp_cont(<<rest::bits>>, original, skip, stack, decode, len) do
+    token = binary_part(original, skip, len)
+    decode(floats: float_decode) = decode
+    float = float_decode.(token, token, skip)
+    continue(rest, original, skip + len, stack, decode, float)
+  end
+
+  defp number_exp_copy(<<byte, rest::bits>>, original, skip, stack, decode, prefix)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, prefix, 1)
+  end
+
+  defp number_exp_copy(<<byte, rest::bits>>, original, skip, stack, decode, prefix)
+       when byte in ~c'+-' do
+    number_exp_sign(rest, original, skip, stack, decode, prefix, 1)
+  end
+
+  defp number_exp_copy(<<_rest::bits>>, original, skip, _stack, _decode, _prefix) do
     error(original, skip)
   end
 
-  defp number_exp_sign(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         prefix,
-         len
-       )
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, prefix, len + 1)
+  defp number_exp_sign(<<byte, rest::bits>>, original, skip, stack, decode, prefix, len)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, prefix, len + 1)
   end
 
-  defp number_exp_sign(
-         <<_rest::bits>>,
-         original,
-         skip,
-         _stack,
-         _key_decode,
-         _string_decode,
-         _prefix,
-         len
-       ) do
+  defp number_exp_sign(<<_rest::bits>>, original, skip, _stack, _decode, _prefix, len) do
     error(original, skip + len)
   end
 
-  defp number_exp_cont(
-         <<byte, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         prefix,
-         len
-       )
-       when byte in '0123456789' do
-    number_exp_cont(rest, original, skip, stack, key_decode, string_decode, prefix, len + 1)
+  defp number_exp_cont(<<byte, rest::bits>>, original, skip, stack, decode, prefix, len)
+       when byte in ~c'0123456789' do
+    number_exp_cont(rest, original, skip, stack, decode, prefix, len + 1)
   end
 
-  defp number_exp_cont(
-         <<rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         prefix,
-         len
-       ) do
+  defp number_exp_cont(<<rest::bits>>, original, skip, stack, decode, prefix, len) do
     suffix = binary_part(original, skip, len)
     string = prefix <> ".0e" <> suffix
     prefix_size = byte_size(prefix)
     initial_skip = skip - prefix_size - 1
     final_skip = skip + len
     token = binary_part(original, initial_skip, prefix_size + len + 1)
-    float = try_parse_float(string, token, initial_skip)
-    continue(rest, original, final_skip, stack, key_decode, string_decode, float)
+    decode(floats: float_decode) = decode
+    float = float_decode.(string, token, initial_skip)
+    continue(rest, original, final_skip, stack, decode, float)
   end
 
-  defp number_zero(<<?., rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
-    number_frac(rest, original, skip, stack, key_decode, string_decode, len + 1)
+  defp number_zero(<<?., rest::bits>>, original, skip, stack, decode, len) do
+    number_frac(rest, original, skip, stack, decode, len + 1)
   end
 
-  defp number_zero(<<e, rest::bits>>, original, skip, stack, key_decode, string_decode, len)
-       when e in 'eE' do
-    number_exp_copy(rest, original, skip + len + 1, stack, key_decode, string_decode, "0")
+  defp number_zero(<<e, rest::bits>>, original, skip, stack, decode, len) when e in ~c'eE' do
+    number_exp_copy(rest, original, skip + len + 1, stack, decode, "0")
   end
 
-  defp number_zero(<<rest::bits>>, original, skip, stack, key_decode, string_decode, len) do
-    continue(rest, original, skip + len, stack, key_decode, string_decode, 0)
+  defp number_zero(<<rest::bits>>, original, skip, stack, decode, len) do
+    continue(rest, original, skip + len, stack, decode, 0)
   end
 
-  @compile {:inline, array: 6}
+  @compile {:inline, array: 5}
 
-  defp array(rest, original, skip, stack, key_decode, string_decode) do
-    value(rest, original, skip, [@array, [] | stack], key_decode, string_decode)
+  defp array(rest, original, skip, stack, decode) do
+    value(rest, original, skip, [@array, [] | stack], decode)
   end
 
-  defp empty_array(<<rest::bits>>, original, skip, stack, key_decode, string_decode) do
+  defp empty_array(<<rest::bits>>, original, skip, stack, decode) do
     case stack do
       [@array, [] | stack] ->
-        continue(rest, original, skip, stack, key_decode, string_decode, [])
+        continue(rest, original, skip, stack, decode, [])
 
       _ ->
         error(original, skip - 1)
     end
   end
 
-  defp array(data, original, skip, stack, key_decode, string_decode, value) do
+  defp array(data, original, skip, stack, decode, value) do
     bytecase data do
-      _ in '\s\n\t\r', rest ->
-        array(rest, original, skip + 1, stack, key_decode, string_decode, value)
+      _ in ~c'\s\n\t\r', rest ->
+        array(rest, original, skip + 1, stack, decode, value)
 
-      _ in ']', rest ->
+      _ in ~c']', rest ->
         [acc | stack] = stack
         value = :lists.reverse(acc, [value])
-        continue(rest, original, skip + 1, stack, key_decode, string_decode, value)
+        continue(rest, original, skip + 1, stack, decode, value)
 
-      _ in ',', rest ->
+      _ in ~c',', rest ->
         [acc | stack] = stack
-
-        value(
-          rest,
-          original,
-          skip + 1,
-          [@array, [value | acc] | stack],
-          key_decode,
-          string_decode
-        )
+        value(rest, original, skip + 1, [@array, [value | acc] | stack], decode)
 
       _, _rest ->
         error(original, skip)
@@ -405,28 +378,31 @@ defmodule Aqua.Jason.Decoder do
     end
   end
 
-  @compile {:inline, object: 6}
+  @compile {:inline, object: 5}
 
-  defp object(rest, original, skip, stack, key_decode, string_decode) do
-    key(rest, original, skip, [[] | stack], key_decode, string_decode)
+  defp object(rest, original, skip, stack, decode) do
+    key(rest, original, skip, [[] | stack], decode)
   end
 
-  defp object(data, original, skip, stack, key_decode, string_decode, value) do
+  defp object(data, original, skip, stack, decode, value) do
     bytecase data do
-      _ in '\s\n\t\r', rest ->
-        object(rest, original, skip + 1, stack, key_decode, string_decode, value)
+      _ in ~c'\s\n\t\r', rest ->
+        object(rest, original, skip + 1, stack, decode, value)
 
-      _ in '}', rest ->
+      _ in ~c'}', rest ->
         skip = skip + 1
         [key, acc | stack] = stack
+        decode(keys: key_decode) = decode
         final = [{key_decode.(key), value} | acc]
-        continue(rest, original, skip, stack, key_decode, string_decode, :maps.from_list(final))
+        decode(objects: object_decode) = decode
+        continue(rest, original, skip, stack, decode, object_decode.(final))
 
-      _ in ',', rest ->
+      _ in ~c',', rest ->
         skip = skip + 1
         [key, acc | stack] = stack
+        decode(keys: key_decode) = decode
         acc = [{key_decode.(key), value} | acc]
-        key(rest, original, skip, [acc | stack], key_decode, string_decode)
+        key(rest, original, skip, [acc | stack], decode)
 
       _, _rest ->
         error(original, skip)
@@ -436,22 +412,23 @@ defmodule Aqua.Jason.Decoder do
     end
   end
 
-  defp key(data, original, skip, stack, key_decode, string_decode) do
+  defp key(data, original, skip, stack, decode) do
     bytecase data do
-      _ in '\s\n\t\r', rest ->
-        key(rest, original, skip + 1, stack, key_decode, string_decode)
+      _ in ~c'\s\n\t\r', rest ->
+        key(rest, original, skip + 1, stack, decode)
 
-      _ in '}', rest ->
+      _ in ~c'}', rest ->
         case stack do
           [[] | stack] ->
-            continue(rest, original, skip + 1, stack, key_decode, string_decode, %{})
+            decode(objects: object_decode) = decode
+            continue(rest, original, skip + 1, stack, decode, object_decode.([]))
 
           _ ->
             error(original, skip)
         end
 
-      _ in '"', rest ->
-        string(rest, original, skip + 1, [@key | stack], key_decode, string_decode, 0)
+      _ in ~c'"', rest ->
+        string(rest, original, skip + 1, [@key | stack], decode, 0)
 
       _, _rest ->
         error(original, skip)
@@ -461,13 +438,13 @@ defmodule Aqua.Jason.Decoder do
     end
   end
 
-  defp key(data, original, skip, stack, key_decode, string_decode, value) do
+  defp key(data, original, skip, stack, decode, value) do
     bytecase data do
-      _ in '\s\n\t\r', rest ->
-        key(rest, original, skip + 1, stack, key_decode, string_decode, value)
+      _ in ~c'\s\n\t\r', rest ->
+        key(rest, original, skip + 1, stack, decode, value)
 
-      _ in ':', rest ->
-        value(rest, original, skip + 1, [@object, value | stack], key_decode, string_decode)
+      _ in ~c':', rest ->
+        value(rest, original, skip + 1, [@object, value | stack], decode)
 
       _, _rest ->
         error(original, skip)
@@ -477,95 +454,99 @@ defmodule Aqua.Jason.Decoder do
     end
   end
 
-  defp string(data, original, skip, stack, key_decode, string_decode, len) do
+  # TODO: check if this approach would be faster:
+  # https://git.ninenines.eu/cowlib.git/tree/src/cow_ws.erl#n469
+  # http://bjoern.hoehrmann.de/utf-8/decoder/dfa/
+  defp string(data, original, skip, stack, decode, len) do
     bytecase data, 128 do
-      _ in '"', rest ->
+      _ in ~c'"', rest ->
+        decode(strings: string_decode) = decode
         string = string_decode.(binary_part(original, skip, len))
-        continue(rest, original, skip + len + 1, stack, key_decode, string_decode, string)
+        continue(rest, original, skip + len + 1, stack, decode, string)
 
-      _ in '\\', rest ->
+      _ in ~c'\\', rest ->
         part = binary_part(original, skip, len)
-        escape(rest, original, skip + len, stack, key_decode, string_decode, part)
+        escape(rest, original, skip + len, stack, decode, part)
 
       _ in unquote(0x00..0x1F), _rest ->
-        error(original, skip)
+        error(original, skip + len)
 
       _, rest ->
-        string(rest, original, skip, stack, key_decode, string_decode, len + 1)
+        string(rest, original, skip, stack, decode, len + 1)
 
       <<char::utf8, rest::bits>> when char <= 0x7FF ->
-        string(rest, original, skip, stack, key_decode, string_decode, len + 2)
+        string(rest, original, skip, stack, decode, len + 2)
 
       <<char::utf8, rest::bits>> when char <= 0xFFFF ->
-        string(rest, original, skip, stack, key_decode, string_decode, len + 3)
+        string(rest, original, skip, stack, decode, len + 3)
 
       <<_char::utf8, rest::bits>> ->
-        string(rest, original, skip, stack, key_decode, string_decode, len + 4)
+        string(rest, original, skip, stack, decode, len + 4)
 
       <<_::bits>> ->
         empty_error(original, skip + len)
     end
   end
 
-  defp string(data, original, skip, stack, key_decode, string_decode, acc, len) do
+  defp string(data, original, skip, stack, decode, acc, len) do
     bytecase data, 128 do
-      _ in '"', rest ->
+      _ in ~c'"', rest ->
         last = binary_part(original, skip, len)
         string = IO.iodata_to_binary([acc | last])
-        continue(rest, original, skip + len + 1, stack, key_decode, string_decode, string)
+        continue(rest, original, skip + len + 1, stack, decode, string)
 
-      _ in '\\', rest ->
+      _ in ~c'\\', rest ->
         part = binary_part(original, skip, len)
-        escape(rest, original, skip + len, stack, key_decode, string_decode, [acc | part])
+        escape(rest, original, skip + len, stack, decode, [acc | part])
 
       _ in unquote(0x00..0x1F), _rest ->
-        error(original, skip)
+        error(original, skip + len)
 
       _, rest ->
-        string(rest, original, skip, stack, key_decode, string_decode, acc, len + 1)
+        string(rest, original, skip, stack, decode, acc, len + 1)
 
       <<char::utf8, rest::bits>> when char <= 0x7FF ->
-        string(rest, original, skip, stack, key_decode, string_decode, acc, len + 2)
+        string(rest, original, skip, stack, decode, acc, len + 2)
 
       <<char::utf8, rest::bits>> when char <= 0xFFFF ->
-        string(rest, original, skip, stack, key_decode, string_decode, acc, len + 3)
+        string(rest, original, skip, stack, decode, acc, len + 3)
 
       <<_char::utf8, rest::bits>> ->
-        string(rest, original, skip, stack, key_decode, string_decode, acc, len + 4)
+        string(rest, original, skip, stack, decode, acc, len + 4)
 
       <<_::bits>> ->
         empty_error(original, skip + len)
     end
   end
 
-  defp escape(data, original, skip, stack, key_decode, string_decode, acc) do
+  defp escape(data, original, skip, stack, decode, acc) do
     bytecase data do
-      _ in 'b', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\b'], 0)
+      _ in ~c'b', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\b'], 0)
 
-      _ in 't', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\t'], 0)
+      _ in ~c't', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\t'], 0)
 
-      _ in 'n', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\n'], 0)
+      _ in ~c'n', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\n'], 0)
 
-      _ in 'f', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\f'], 0)
+      _ in ~c'f', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\f'], 0)
 
-      _ in 'r', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\r'], 0)
+      _ in ~c'r', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\r'], 0)
 
-      _ in '"', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\"'], 0)
+      _ in ~c'"', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\"'], 0)
 
-      _ in '/', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '/'], 0)
+      _ in ~c'/', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'/'], 0)
 
-      _ in '\\', rest ->
-        string(rest, original, skip + 2, stack, key_decode, string_decode, [acc | '\\'], 0)
+      _ in ~c'\\', rest ->
+        string(rest, original, skip + 2, stack, decode, [acc | ~c'\\'], 0)
 
-      _ in 'u', rest ->
-        escapeu(rest, original, skip, stack, key_decode, string_decode, acc)
+      _ in ~c'u', rest ->
+        escapeu(rest, original, skip, stack, decode, acc)
 
       _, _rest ->
         error(original, skip + 1)
@@ -603,9 +584,8 @@ defmodule Aqua.Jason.Decoder do
       end
     end
 
-    defmacro escapeu_first(int, last, rest, original, skip, stack, key_decode, string_decode, acc) do
-      clauses =
-        escapeu_first_clauses(last, rest, original, skip, stack, key_decode, string_decode, acc)
+    defmacro escapeu_first(int, last, rest, original, skip, stack, decode, acc) do
+      clauses = escapeu_first_clauses(last, rest, original, skip, stack, decode, acc)
 
       quote location: :keep do
         case unquote(int) do
@@ -614,43 +594,21 @@ defmodule Aqua.Jason.Decoder do
       end
     end
 
-    defp escapeu_first_clauses(last, rest, original, skip, stack, key_decode, string_decode, acc) do
+    defp escapeu_first_clauses(last, rest, original, skip, stack, decode, acc) do
       for {int, first} <- unicode_escapes(),
-          not (first in 0xDC..0xDF) do
-        escapeu_first_clause(
-          int,
-          first,
-          last,
-          rest,
-          original,
-          skip,
-          stack,
-          key_decode,
-          string_decode,
-          acc
-        )
+          first not in 0xDC..0xDF do
+        escapeu_first_clause(int, first, last, rest, original, skip, stack, decode, acc)
       end
     end
 
-    defp escapeu_first_clause(
-           int,
-           first,
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc
-         )
+    defp escapeu_first_clause(int, first, last, rest, original, skip, stack, decode, acc)
          when first in 0xD8..0xDB do
       hi =
         quote bind_quoted: [first: first, last: last] do
           0x10000 + ((((first &&& 0x03) <<< 8) + last) <<< 10)
         end
 
-      args = [rest, original, skip, stack, key_decode, string_decode, acc, hi]
+      args = [rest, original, skip, stack, decode, acc, hi]
 
       [clause] =
         quote location: :keep do
@@ -660,18 +618,7 @@ defmodule Aqua.Jason.Decoder do
       clause
     end
 
-    defp escapeu_first_clause(
-           int,
-           first,
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc
-         )
+    defp escapeu_first_clause(int, first, last, rest, original, skip, stack, decode, acc)
          when first <= 0x00 do
       skip = quote do: unquote(skip) + 6
 
@@ -688,7 +635,7 @@ defmodule Aqua.Jason.Decoder do
           end
         end
 
-      args = [rest, original, skip, stack, key_decode, string_decode, acc, 0]
+      args = [rest, original, skip, stack, decode, acc, 0]
 
       [clause] =
         quote location: :keep do
@@ -698,18 +645,7 @@ defmodule Aqua.Jason.Decoder do
       clause
     end
 
-    defp escapeu_first_clause(
-           int,
-           first,
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc
-         )
+    defp escapeu_first_clause(int, first, last, rest, original, skip, stack, decode, acc)
          when first <= 0x07 do
       skip = quote do: unquote(skip) + 6
 
@@ -721,7 +657,7 @@ defmodule Aqua.Jason.Decoder do
           [acc, byte1, byte2]
         end
 
-      args = [rest, original, skip, stack, key_decode, string_decode, acc, 0]
+      args = [rest, original, skip, stack, decode, acc, 0]
 
       [clause] =
         quote location: :keep do
@@ -731,18 +667,7 @@ defmodule Aqua.Jason.Decoder do
       clause
     end
 
-    defp escapeu_first_clause(
-           int,
-           first,
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc
-         )
+    defp escapeu_first_clause(int, first, last, rest, original, skip, stack, decode, acc)
          when first <= 0xFF do
       skip = quote do: unquote(skip) + 6
 
@@ -755,7 +680,7 @@ defmodule Aqua.Jason.Decoder do
           [acc, byte1, byte2, byte3]
         end
 
-      args = [rest, original, skip, stack, key_decode, string_decode, acc, 0]
+      args = [rest, original, skip, stack, decode, acc, 0]
 
       [clause] =
         quote location: :keep do
@@ -786,30 +711,8 @@ defmodule Aqua.Jason.Decoder do
       end
     end
 
-    defmacro escapeu_surrogate(
-               int,
-               last,
-               rest,
-               original,
-               skip,
-               stack,
-               key_decode,
-               string_decode,
-               acc,
-               hi
-             ) do
-      clauses =
-        escapeu_surrogate_clauses(
-          last,
-          rest,
-          original,
-          skip,
-          stack,
-          key_decode,
-          string_decode,
-          acc,
-          hi
-        )
+    defmacro escapeu_surrogate(int, last, rest, original, skip, stack, decode, acc, hi) do
+      clauses = escapeu_surrogate_clauses(last, rest, original, skip, stack, decode, acc, hi)
 
       quote location: :keep do
         case unquote(int) do
@@ -818,50 +721,16 @@ defmodule Aqua.Jason.Decoder do
       end
     end
 
-    defp escapeu_surrogate_clauses(
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc,
-           hi
-         ) do
-      digits1 = 'Dd'
+    defp escapeu_surrogate_clauses(last, rest, original, skip, stack, decode, acc, hi) do
+      digits1 = ~c'Dd'
       digits2 = Stream.concat([?C..?F, ?c..?f])
 
       for {int, first} <- unicode_escapes(digits1, digits2) do
-        escapeu_surrogate_clause(
-          int,
-          first,
-          last,
-          rest,
-          original,
-          skip,
-          stack,
-          key_decode,
-          string_decode,
-          acc,
-          hi
-        )
+        escapeu_surrogate_clause(int, first, last, rest, original, skip, stack, decode, acc, hi)
       end
     end
 
-    defp escapeu_surrogate_clause(
-           int,
-           first,
-           last,
-           rest,
-           original,
-           skip,
-           stack,
-           key_decode,
-           string_decode,
-           acc,
-           hi
-         ) do
+    defp escapeu_surrogate_clause(int, first, last, rest, original, skip, stack, decode, acc, hi) do
       skip = quote do: unquote(skip) + 12
 
       acc =
@@ -870,7 +739,7 @@ defmodule Aqua.Jason.Decoder do
           [acc | <<hi + lo::utf8>>]
         end
 
-      args = [rest, original, skip, stack, key_decode, string_decode, acc, 0]
+      args = [rest, original, skip, stack, decode, acc, 0]
 
       [clause] =
         quote do
@@ -882,32 +751,13 @@ defmodule Aqua.Jason.Decoder do
     end
   end
 
-  defp escapeu(
-         <<int1::16, int2::16, rest::bits>>,
-         original,
-         skip,
-         stack,
-         key_decode,
-         string_decode,
-         acc
-       ) do
+  defp escapeu(<<int1::16, int2::16, rest::bits>>, original, skip, stack, decode, acc) do
     require Unescape
     last = escapeu_last(int2, original, skip)
-
-    Unescape.escapeu_first(
-      int1,
-      last,
-      rest,
-      original,
-      skip,
-      stack,
-      key_decode,
-      string_decode,
-      acc
-    )
+    Unescape.escapeu_first(int1, last, rest, original, skip, stack, decode, acc)
   end
 
-  defp escapeu(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode, _acc) do
+  defp escapeu(<<_rest::bits>>, original, skip, _stack, _decode, _acc) do
     empty_error(original, skip)
   end
 
@@ -923,49 +773,20 @@ defmodule Aqua.Jason.Decoder do
          original,
          skip,
          stack,
-         key_decode,
-         string_decode,
+         decode,
          acc,
          hi
        ) do
     require Unescape
     last = escapeu_last(int2, original, skip + 6)
-
-    Unescape.escapeu_surrogate(
-      int1,
-      last,
-      rest,
-      original,
-      skip,
-      stack,
-      key_decode,
-      string_decode,
-      acc,
-      hi
-    )
+    Unescape.escapeu_surrogate(int1, last, rest, original, skip, stack, decode, acc, hi)
   end
 
-  defp escape_surrogate(
-         <<_rest::bits>>,
-         original,
-         skip,
-         _stack,
-         _key_decode,
-         _string_decode,
-         _acc,
-         _hi
-       ) do
+  defp escape_surrogate(<<_rest::bits>>, original, skip, _stack, _decode, _acc, _hi) do
     error(original, skip + 6)
   end
 
-  defp try_parse_float(string, token, skip) do
-    :erlang.binary_to_float(string)
-  catch
-    :error, :badarg ->
-      token_error(token, skip)
-  end
-
-  defp error(<<_rest::bits>>, _original, skip, _stack, _key_decode, _string_decode) do
+  defp error(<<_rest::bits>>, _original, skip, _stack, _decode) do
     throw({:position, skip - 1})
   end
 
@@ -986,33 +807,33 @@ defmodule Aqua.Jason.Decoder do
     throw({:token, binary_part(token, position, len), position})
   end
 
-  @compile {:inline, continue: 7}
-  defp continue(rest, original, skip, stack, key_decode, string_decode, value) do
+  @compile {:inline, continue: 6}
+  defp continue(rest, original, skip, stack, decode, value) do
     case stack do
       [@terminate | stack] ->
-        terminate(rest, original, skip, stack, key_decode, string_decode, value)
+        terminate(rest, original, skip, stack, decode, value)
 
       [@array | stack] ->
-        array(rest, original, skip, stack, key_decode, string_decode, value)
+        array(rest, original, skip, stack, decode, value)
 
       [@key | stack] ->
-        key(rest, original, skip, stack, key_decode, string_decode, value)
+        key(rest, original, skip, stack, decode, value)
 
       [@object | stack] ->
-        object(rest, original, skip, stack, key_decode, string_decode, value)
+        object(rest, original, skip, stack, decode, value)
     end
   end
 
-  defp terminate(<<byte, rest::bits>>, original, skip, stack, key_decode, string_decode, value)
-       when byte in '\s\n\r\t' do
-    terminate(rest, original, skip + 1, stack, key_decode, string_decode, value)
+  defp terminate(<<byte, rest::bits>>, original, skip, stack, decode, value)
+       when byte in ~c'\s\n\r\t' do
+    terminate(rest, original, skip + 1, stack, decode, value)
   end
 
-  defp terminate(<<>>, _original, _skip, _stack, _key_decode, _string_decode, value) do
+  defp terminate(<<>>, _original, _skip, _stack, _decode, value) do
     value
   end
 
-  defp terminate(<<_rest::bits>>, original, skip, _stack, _key_decode, _string_decode, _value) do
+  defp terminate(<<_rest::bits>>, original, skip, _stack, _decode, _value) do
     error(original, skip)
   end
 end

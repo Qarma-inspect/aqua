@@ -1,5 +1,4 @@
 defmodule Aqua.Jason.EncodeError do
-  @moduledoc false
   defexception [:message]
 
   @type t :: %__MODULE__{message: String.t()}
@@ -14,15 +13,19 @@ defmodule Aqua.Jason.EncodeError do
 end
 
 defmodule Aqua.Jason.Encode do
-  @moduledoc false
+  @moduledoc """
+  Utilities for encoding elixir values to JSON.
+  """
 
   import Bitwise
 
-  alias Aqua.Jason.{Codegen, EncodeError, Encoder, Fragment}
+  alias Jason.{Codegen, EncodeError, Encoder, Fragment, OrderedObject}
 
   @typep escape :: (String.t(), String.t(), integer -> iodata)
   @typep encode_map :: (map, escape, encode_map -> iodata)
   @opaque opts :: {escape, encode_map}
+
+  @dialyzer :no_improper_lists
 
   # @compile :native
 
@@ -38,7 +41,7 @@ defmodule Aqua.Jason.Encode do
       :throw, %EncodeError{} = e ->
         {:error, e}
 
-      :error, %Protocol.UndefinedError{protocol: Jason.Encoder} = e ->
+      :error, %Protocol.UndefinedError{protocol: Aqua.Jason.Encoder} = e ->
         {:error, e}
     end
   end
@@ -99,7 +102,10 @@ defmodule Aqua.Jason.Encode do
   end
 
   def value(value, escape, encode_map) when is_map(value) do
-    encode_map.(value, escape, encode_map)
+    case Map.to_list(value) do
+      [] -> "{}"
+      keyword -> encode_map.(keyword, escape, encode_map)
+    end
   end
 
   def value(value, escape, encode_map) do
@@ -125,9 +131,24 @@ defmodule Aqua.Jason.Encode do
     Integer.to_string(integer)
   end
 
+  has_short_format =
+    try do
+      :erlang.float_to_binary(1.0, [:short])
+    catch
+      _, _ -> false
+    else
+      _ -> true
+    end
+
   @spec float(float) :: iodata
-  def float(float) do
-    :io_lib_format.fwrite_g(float)
+  if has_short_format do
+    def float(float) do
+      :erlang.float_to_binary(float, [:short])
+    end
+  else
+    def float(float) do
+      :io_lib_format.fwrite_g(float)
+    end
   end
 
   @spec list(list, opts) :: iodata
@@ -148,7 +169,7 @@ defmodule Aqua.Jason.Encode do
   end
 
   defp list_loop([], _escape, _encode_map) do
-    ']'
+    ~c']'
   end
 
   defp list_loop([head | tail], escape, encode_map) do
@@ -160,17 +181,18 @@ defmodule Aqua.Jason.Encode do
   end
 
   @spec keyword(keyword, opts) :: iodata
-  def keyword(list, {escape, encode_map}) do
+  def keyword(list, _) when list == [], do: "{}"
+
+  def keyword(list, {escape, encode_map}) when is_list(list) do
     encode_map.(list, escape, encode_map)
   end
 
   @spec map(map, opts) :: iodata
   def map(value, {escape, encode_map}) do
-    encode_map.(value, escape, encode_map)
-  end
-
-  defp map_naive([], _escape, _encode_map) do
-    "{}"
+    case Map.to_list(value) do
+      [] -> "{}"
+      keyword -> encode_map.(keyword, escape, encode_map)
+    end
   end
 
   defp map_naive([{key, value} | tail], escape, encode_map) do
@@ -183,14 +205,8 @@ defmodule Aqua.Jason.Encode do
     ]
   end
 
-  defp map_naive(value, escape, encode_map) do
-    value
-    |> Map.to_list()
-    |> map_naive(escape, encode_map)
-  end
-
   defp map_naive_loop([], _escape, _encode_map) do
-    '}'
+    ~c'}'
   end
 
   defp map_naive_loop([{key, value} | tail], escape, encode_map) do
@@ -201,10 +217,6 @@ defmodule Aqua.Jason.Encode do
       value(value, escape, encode_map)
       | map_naive_loop(tail, escape, encode_map)
     ]
-  end
-
-  defp map_strict([], _escape, _encode_map) do
-    "{}"
   end
 
   defp map_strict([{key, value} | tail], escape, encode_map) do
@@ -220,14 +232,8 @@ defmodule Aqua.Jason.Encode do
     ]
   end
 
-  defp map_strict(value, escape, encode_map) do
-    value
-    |> Map.to_list()
-    |> map_strict(escape, encode_map)
-  end
-
   defp map_strict_loop([], _encode_map, _escape, _visited) do
-    '}'
+    ~c'}'
   end
 
   defp map_strict_loop([{key, value} | tail], escape, encode_map, visited) do
@@ -255,21 +261,29 @@ defmodule Aqua.Jason.Encode do
     struct(value, escape, encode_map, module)
   end
 
+  # TODO: benchmark the effect of inlining the to_iso8601 functions
   for module <- [Date, Time, NaiveDateTime, DateTime] do
     defp struct(value, _escape, _encode_map, unquote(module)) do
-      [?\", unquote(module).to_iso8601(value), ?\"]
+      [?", unquote(module).to_iso8601(value), ?"]
     end
   end
 
-  defp struct(value, _escape, _encode_map, Decimal) do
-    # silence the xref warning
-    decimal = Decimal
-    [?\", decimal.to_string(value, :normal), ?\"]
+  if Code.ensure_loaded?(Decimal) do
+    defp struct(value, _escape, _encode_map, Decimal) do
+      [?", Decimal.to_string(value, :normal), ?"]
+    end
   end
 
   defp struct(value, escape, encode_map, Fragment) do
     %{encode: encode} = value
     encode.({escape, encode_map})
+  end
+
+  defp struct(value, escape, encode_map, OrderedObject) do
+    case value do
+      %{values: []} -> "{}"
+      %{values: values} -> encode_map.(values, escape, encode_map)
+    end
   end
 
   defp struct(value, escape, encode_map, _module) do
@@ -298,13 +312,13 @@ defmodule Aqua.Jason.Encode do
   end
 
   defp encode_string(string, escape) do
-    [?\", escape.(string, string, 0), ?\"]
+    [?", escape.(string, string, 0), ?"]
   end
 
-  slash_escapes = Enum.zip('\b\t\n\f\r\"\\', 'btnfr"\\')
+  slash_escapes = Enum.zip(~c'\b\t\n\f\r\"\\', ~c'btnfr"\\')
   surogate_escapes = Enum.zip([0x2028, 0x2029], ["\\u2028", "\\u2029"])
   ranges = [{0x00..0x1F, :unicode} | slash_escapes]
-  html_ranges = [{0x00..0x1F, :unicode}, {?/, ?/} | slash_escapes]
+  html_ranges = [{0x00..0x1F, :unicode}, {?<, :unicode}, {?/, ?/} | slash_escapes]
   escape_jt = Codegen.jump_table(html_ranges, :error)
 
   Enum.each(escape_jt, fn
@@ -647,12 +661,13 @@ defmodule Aqua.Jason.Encode do
   defp escape_unicode(<<char::utf8, rest::bits>>, acc, original, skip) do
     char = char - 0x10000
 
-    acc = [
-      acc,
-      "\\uD",
-      Integer.to_string(0x800 ||| char >>> 10, 16),
-      "\\uD" | Integer.to_string(0xC00 ||| (char &&& 0x3FF), 16)
-    ]
+    acc =
+      [
+        acc,
+        "\\uD",
+        Integer.to_string(0x800 ||| char >>> 10, 16),
+        "\\uD" | Integer.to_string(0xC00 ||| (char &&& 0x3FF), 16)
+      ]
 
     escape_unicode(rest, acc, original, skip + 4)
   end
@@ -713,13 +728,14 @@ defmodule Aqua.Jason.Encode do
     char = char - 0x10000
     part = binary_part(original, skip, len)
 
-    acc = [
-      acc,
-      part,
-      "\\uD",
-      Integer.to_string(0x800 ||| char >>> 10, 16),
-      "\\uD" | Integer.to_string(0xC00 ||| (char &&& 0x3FF), 16)
-    ]
+    acc =
+      [
+        acc,
+        part,
+        "\\uD",
+        Integer.to_string(0x800 ||| char >>> 10, 16),
+        "\\uD" | Integer.to_string(0xC00 ||| (char &&& 0x3FF), 16)
+      ]
 
     escape_unicode(rest, acc, original, skip + len + 4)
   end
