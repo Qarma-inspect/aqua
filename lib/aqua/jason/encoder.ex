@@ -81,7 +81,7 @@ defimpl Aqua.Jason.Encoder, for: Any do
     escape = quote(do: escape)
     encode_map = quote(do: encode_map)
     encode_args = [escape, encode_map]
-    kv_iodata = Jason.Codegen.build_kv_iodata(kv, encode_args)
+    kv_iodata = Aqua.Jason.Codegen.build_kv_iodata(kv, encode_args)
 
     quote do
       defimpl Aqua.Jason.Encoder, for: unquote(module) do
