@@ -2,6 +2,7 @@ defmodule Aqua.Schema.LocalTemplate do
   @moduledoc false
   alias Aqua.Cache
   alias Aqua.Github
+  alias Aqua.Bitbucket
   alias Aqua.Template.Meta
 
   defstruct raw_route: nil,
@@ -44,13 +45,13 @@ defmodule Aqua.Schema.LocalTemplate do
 
   def normalize_route(%__MODULE__{raw_route: route} = local_template) do
     case parse_route(route) do
-      {:ok, org, repo, injection} ->
+      {:ok, provider, org, repo, injection} ->
         %{
           local_template
           | org: org,
             repo: repo,
             injection: injection,
-            git_clone_url: Github.generate_clone_url(org, repo),
+            git_clone_url: provider.generate_clone_url(org, repo),
             fs_path: Cache.generate_path(org, repo)
         }
 
@@ -72,16 +73,32 @@ defmodule Aqua.Schema.LocalTemplate do
 
   defp parse_route(route) do
     case String.split(route, "/") do
-      [org, repo] -> parse_injection(org, repo)
-      [repo] -> parse_injection("aquapm", repo)
-      _ -> {:error, :bad_route}
+      [provider_string, org, repo] ->
+        provider = parse_provider(provider_string)
+        parse_injection(provider, org, repo)
+
+      [org, repo] ->
+        parse_injection(Github, org, repo)
+
+      [repo] ->
+        parse_injection(Github, "aquapm", repo)
+
+      _ ->
+        {:error, :bad_route}
     end
   end
 
-  defp parse_injection(org, path) do
+  defp parse_provider(provider) do
+    case provider do
+      "bitbucket.org" -> Bitbucket
+      _ -> Github
+    end
+  end
+
+  defp parse_injection(provider, org, path) do
     case String.split(path, ".") do
-      [repo, injection] -> {:ok, org, repo, injection}
-      [repo] -> {:ok, org, repo, nil}
+      [repo, injection] -> {:ok, provider, org, repo, injection}
+      [repo] -> {:ok, provider, org, repo, nil}
       _ -> {:error, :bad_route}
     end
   end
